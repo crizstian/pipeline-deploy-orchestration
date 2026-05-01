@@ -1,0 +1,230 @@
+# Update State Stage Template
+# Insertar este stage DESPUÉS del último Deploy stage
+#
+# Uso: Copiar y adaptar para cada pipeline
+# Dependencia: Requiere DEPLOYMENT_MODE de Deployment_Gate stage
+
+- stage:
+    name: Update_State
+    identifier: Update_State
+    description: "Actualiza estado de despliegue para orquestación"
+    type: Custom
+    spec:
+      execution:
+        steps:
+          # Step 1: Leer estado actual antes de actualizar
+          - step:
+              type: Run
+              name: Read_Current_State
+              identifier: Read_Current_State
+              spec:
+                connectorRef: org.simetrikclouddockerhub
+                image: curlimages/curl:latest
+                shell: Sh
+                command: |
+                  echo "=== Reading current state before update ==="
+
+                  # Leer NEXT_REQUIRED
+                  NEXT_REQUIRED=$(curl -s --request GET \
+                    --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_NEXT_REQUIRED?accountIdentifier=<+account.identifier>" \
+                    --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                    | jq -r '.data.variable.value // "1"')
+
+                  # Leer COMPLETED
+                  COMPLETED=$(curl -s --request GET \
+                    --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_COMPLETED?accountIdentifier=<+account.identifier>" \
+                    --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                    | jq -r '.data.variable.value // ""')
+
+                  echo "Current NEXT_REQUIRED: $NEXT_REQUIRED"
+                  echo "Current COMPLETED: $COMPLETED"
+
+                  export NEXT_REQUIRED
+                  export COMPLETED
+                outputVariables:
+                  - name: NEXT_REQUIRED
+                    type: String
+                    value: NEXT_REQUIRED
+                  - name: COMPLETED
+                    type: String
+                    value: COMPLETED
+              timeout: 2m
+
+          # Step 2: Calcular nuevo estado
+          - step:
+              type: Run
+              name: Calculate_New_State
+              identifier: Calculate_New_State
+              spec:
+                shell: Sh
+                command: |
+                  #!/bin/sh
+                  set -e
+
+                  MY_ORDER="<+pipeline.variables.deployment_order>"
+                  DEPLOYMENT_MODE="<+pipeline.stages.Deployment_Gate.spec.execution.steps.Validate_Order.output.outputVariables.DEPLOYMENT_MODE>"
+                  CURRENT_NEXT="<+execution.steps.Read_Current_State.output.outputVariables.NEXT_REQUIRED>"
+                  CURRENT_COMPLETED="<+execution.steps.Read_Current_State.output.outputVariables.COMPLETED>"
+
+                  echo "=== Calculating new state ==="
+                  echo "My Order: $MY_ORDER"
+                  echo "Deployment Mode: $DEPLOYMENT_MODE"
+                  echo "Current NEXT_REQUIRED: $CURRENT_NEXT"
+                  echo "Current COMPLETED: $CURRENT_COMPLETED"
+                  echo ""
+
+                  if [ "$DEPLOYMENT_MODE" = "NORMAL" ]; then
+                    # Flujo normal: incrementar NEXT y agregar a COMPLETED
+                    NEW_NEXT=$((MY_ORDER + 1))
+
+                    if [ -z "$CURRENT_COMPLETED" ]; then
+                      NEW_COMPLETED="$MY_ORDER"
+                    else
+                      NEW_COMPLETED="${CURRENT_COMPLETED},${MY_ORDER}"
+                    fi
+
+                    echo ">>> NORMAL FLOW: Updating state"
+                    echo "    NEW_NEXT_REQUIRED: $NEW_NEXT"
+                    echo "    NEW_COMPLETED: $NEW_COMPLETED"
+
+                    export NEW_NEXT_REQUIRED="$NEW_NEXT"
+                    export NEW_COMPLETED="$NEW_COMPLETED"
+                    export SHOULD_UPDATE="true"
+
+                  elif [ "$DEPLOYMENT_MODE" = "HOTFIX" ]; then
+                    # Hotfix: NO modificar estado
+                    echo ">>> HOTFIX MODE: State unchanged"
+                    echo "    NEXT_REQUIRED remains: $CURRENT_NEXT"
+                    echo "    COMPLETED remains: $CURRENT_COMPLETED"
+
+                    export NEW_NEXT_REQUIRED="$CURRENT_NEXT"
+                    export NEW_COMPLETED="$CURRENT_COMPLETED"
+                    export SHOULD_UPDATE="false"
+
+                  else
+                    echo ">>> ERROR: Unknown deployment mode: $DEPLOYMENT_MODE"
+                    exit 1
+                  fi
+                outputVariables:
+                  - name: NEW_NEXT_REQUIRED
+                    type: String
+                    value: NEW_NEXT_REQUIRED
+                  - name: NEW_COMPLETED
+                    type: String
+                    value: NEW_COMPLETED
+                  - name: SHOULD_UPDATE
+                    type: String
+                    value: SHOULD_UPDATE
+              timeout: 1m
+
+          # Step 3: Escribir nuevo estado (solo si NORMAL flow)
+          - step:
+              type: Run
+              name: Write_State
+              identifier: Write_State
+              spec:
+                connectorRef: org.simetrikclouddockerhub
+                image: curlimages/curl:latest
+                shell: Sh
+                command: |
+                  #!/bin/sh
+                  set -e
+
+                  SHOULD_UPDATE="<+execution.steps.Calculate_New_State.output.outputVariables.SHOULD_UPDATE>"
+                  NEW_NEXT="<+execution.steps.Calculate_New_State.output.outputVariables.NEW_NEXT_REQUIRED>"
+                  NEW_COMPLETED="<+execution.steps.Calculate_New_State.output.outputVariables.NEW_COMPLETED>"
+
+                  echo "=== Write State ==="
+                  echo "Should Update: $SHOULD_UPDATE"
+
+                  if [ "$SHOULD_UPDATE" = "true" ]; then
+                    echo "Updating STAGE_RELEASE_NEXT_REQUIRED to: $NEW_NEXT"
+
+                    # Update NEXT_REQUIRED
+                    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --request PUT \
+                      --url "https://app.harness.io/gateway/ng/api/variables?accountIdentifier=<+account.identifier>" \
+                      --header "Content-Type: application/json" \
+                      --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                      --data '{
+                        "variable": {
+                          "identifier": "STAGE_RELEASE_NEXT_REQUIRED",
+                          "name": "STAGE_RELEASE_NEXT_REQUIRED",
+                          "type": "String",
+                          "value": "'"$NEW_NEXT"'"
+                        }
+                      }')
+
+                    if [ "$HTTP_CODE" -ne 200 ]; then
+                      echo "ERROR: Failed to update NEXT_REQUIRED (HTTP $HTTP_CODE)"
+                      exit 1
+                    fi
+                    echo "  ✓ NEXT_REQUIRED updated"
+
+                    echo "Updating STAGE_RELEASE_COMPLETED to: $NEW_COMPLETED"
+
+                    # Update COMPLETED
+                    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --request PUT \
+                      --url "https://app.harness.io/gateway/ng/api/variables?accountIdentifier=<+account.identifier>" \
+                      --header "Content-Type: application/json" \
+                      --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                      --data '{
+                        "variable": {
+                          "identifier": "STAGE_RELEASE_COMPLETED",
+                          "name": "STAGE_RELEASE_COMPLETED",
+                          "type": "String",
+                          "value": "'"$NEW_COMPLETED"'"
+                        }
+                      }')
+
+                    if [ "$HTTP_CODE" -ne 200 ]; then
+                      echo "ERROR: Failed to update COMPLETED (HTTP $HTTP_CODE)"
+                      exit 1
+                    fi
+                    echo "  ✓ COMPLETED updated"
+
+                    echo ""
+                    echo "=== State Updated Successfully ==="
+                    echo "NEXT_REQUIRED: $NEW_NEXT"
+                    echo "COMPLETED: $NEW_COMPLETED"
+
+                  else
+                    echo "Skipping update (HOTFIX mode - state unchanged)"
+                    echo ""
+                    echo "=== Hotfix Deployment Complete ==="
+                    echo "State preserved for normal flow continuation"
+                  fi
+              timeout: 2m
+
+          # Step 4: Log final
+          - step:
+              type: Run
+              name: Deployment_Complete
+              identifier: Deployment_Complete
+              spec:
+                shell: Sh
+                command: |
+                  echo "=========================================="
+                  echo "       DEPLOYMENT COMPLETE"
+                  echo "=========================================="
+                  echo ""
+                  echo "Pipeline: <+pipeline.name>"
+                  echo "Order: <+pipeline.variables.deployment_order>"
+                  echo "Mode: <+pipeline.stages.Deployment_Gate.spec.execution.steps.Validate_Order.output.outputVariables.DEPLOYMENT_MODE>"
+                  echo "Execution ID: <+pipeline.executionId>"
+                  echo "Timestamp: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+                  echo ""
+                  echo "Next service in queue can now proceed."
+                  echo "=========================================="
+              timeout: 1m
+
+    tags: {}
+    when:
+      pipelineStatus: Success
+
+# Nota: Este stage referencia el output de Deployment_Gate.
+# Asegúrate de que el path a la variable DEPLOYMENT_MODE sea correcto
+# según la estructura de tu pipeline.
+#
+# Paths posibles:
+#   - <+pipeline.stages.Deployment_Gate.spec.execution.steps.Validate_Order.output.outputVariables.DEPLOYMENT_MODE>
+#   - <+execution.steps.Validate_Order.output.outputVariables.DEPLOYMENT_MODE> (si está en el mismo stage)

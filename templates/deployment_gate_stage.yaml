@@ -1,0 +1,195 @@
+# Deployment Gate Stage Template
+# Insertar este stage DESPUÉS de Approval y ANTES del primer Deploy stage
+#
+# Uso: Copiar y adaptar para cada pipeline
+# Parámetro requerido: deployment_order (variable del pipeline)
+
+- stage:
+    name: Deployment_Gate
+    identifier: Deployment_Gate
+    description: "Espera turno de despliegue según orden secuencial"
+    type: Custom
+    spec:
+      execution:
+        steps:
+          # Step 1: Leer estado actual
+          - step:
+              type: Run
+              name: Read_State
+              identifier: Read_State
+              spec:
+                connectorRef: org.simetrikclouddockerhub
+                image: curlimages/curl:latest
+                shell: Sh
+                command: |
+                  echo "=== Reading deployment state ==="
+                  echo "My deployment order: <+pipeline.variables.deployment_order>"
+
+                  # Leer NEXT_REQUIRED
+                  NEXT_REQUIRED=$(curl -s --request GET \
+                    --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_NEXT_REQUIRED?accountIdentifier=<+account.identifier>" \
+                    --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                    | jq -r '.data.variable.value // "1"')
+
+                  # Leer COMPLETED
+                  COMPLETED=$(curl -s --request GET \
+                    --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_COMPLETED?accountIdentifier=<+account.identifier>" \
+                    --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                    | jq -r '.data.variable.value // ""')
+
+                  echo "Current NEXT_REQUIRED: $NEXT_REQUIRED"
+                  echo "Current COMPLETED: $COMPLETED"
+
+                  # Export for next steps
+                  export NEXT_REQUIRED
+                  export COMPLETED
+                outputVariables:
+                  - name: NEXT_REQUIRED
+                    type: String
+                    value: NEXT_REQUIRED
+                  - name: COMPLETED
+                    type: String
+                    value: COMPLETED
+              timeout: 2m
+
+          # Step 2: Validar orden y esperar turno
+          - step:
+              type: Run
+              name: Validate_Order
+              identifier: Validate_Order
+              spec:
+                connectorRef: org.simetrikclouddockerhub
+                image: curlimages/curl:latest
+                shell: Sh
+                command: |
+                  #!/bin/sh
+                  set -e
+
+                  MY_ORDER="<+pipeline.variables.deployment_order>"
+                  NEXT_REQUIRED="<+execution.steps.Read_State.output.outputVariables.NEXT_REQUIRED>"
+                  COMPLETED="<+execution.steps.Read_State.output.outputVariables.COMPLETED>"
+
+                  MAX_WAIT_SECONDS=14400  # 4 horas
+                  POLL_INTERVAL=30        # 30 segundos
+                  ELAPSED=0
+
+                  echo "=== Deployment Order Validation ==="
+                  echo "My Order: $MY_ORDER"
+                  echo "Next Required: $NEXT_REQUIRED"
+                  echo "Completed: $COMPLETED"
+                  echo "Max Wait: ${MAX_WAIT_SECONDS}s"
+                  echo ""
+
+                  # Función para verificar si estoy en COMPLETED
+                  is_in_completed() {
+                    echo ",$COMPLETED," | grep -q ",$MY_ORDER,"
+                  }
+
+                  # Función para leer estado actual
+                  read_current_state() {
+                    NEXT_REQUIRED=$(curl -s --request GET \
+                      --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_NEXT_REQUIRED?accountIdentifier=<+account.identifier>" \
+                      --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                      | jq -r '.data.variable.value // "1"')
+
+                    COMPLETED=$(curl -s --request GET \
+                      --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_COMPLETED?accountIdentifier=<+account.identifier>" \
+                      --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                      | jq -r '.data.variable.value // ""')
+                  }
+
+                  # Loop principal
+                  while true; do
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Checking state..."
+                    echo "  NEXT_REQUIRED=$NEXT_REQUIRED, COMPLETED=$COMPLETED"
+
+                    # Caso 1: Es mi turno (flujo normal)
+                    if [ "$MY_ORDER" -eq "$NEXT_REQUIRED" ]; then
+                      echo ""
+                      echo ">>> PROCEED: My turn (order $MY_ORDER == next_required $NEXT_REQUIRED)"
+                      echo ">>> Mode: NORMAL_FLOW"
+                      export DEPLOYMENT_MODE="NORMAL"
+                      break
+                    fi
+
+                    # Caso 2: Hotfix (ya completé antes)
+                    if [ "$MY_ORDER" -lt "$NEXT_REQUIRED" ]; then
+                      if is_in_completed; then
+                        echo ""
+                        echo ">>> PROCEED: Hotfix mode (order $MY_ORDER already in completed)"
+                        echo ">>> Mode: HOTFIX"
+                        export DEPLOYMENT_MODE="HOTFIX"
+                        break
+                      else
+                        echo ""
+                        echo ">>> ERROR: Inconsistent state"
+                        echo "    My order ($MY_ORDER) < next_required ($NEXT_REQUIRED)"
+                        echo "    But I'm not in COMPLETED list ($COMPLETED)"
+                        echo "    This should not happen. Manual intervention required."
+                        exit 1
+                      fi
+                    fi
+
+                    # Caso 3: Esperando (aún no es mi turno)
+                    if [ "$MY_ORDER" -gt "$NEXT_REQUIRED" ]; then
+                      echo "  Waiting: my order ($MY_ORDER) > next_required ($NEXT_REQUIRED)"
+                      echo "  Sleeping ${POLL_INTERVAL}s..."
+                      echo ""
+
+                      sleep $POLL_INTERVAL
+                      ELAPSED=$((ELAPSED + POLL_INTERVAL))
+
+                      # Check timeout
+                      if [ "$ELAPSED" -ge "$MAX_WAIT_SECONDS" ]; then
+                        echo ""
+                        echo ">>> TIMEOUT: Waited ${ELAPSED}s (max: ${MAX_WAIT_SECONDS}s)"
+                        echo "    Still waiting for service $NEXT_REQUIRED to complete"
+                        echo "    Please check the status of pipeline with order=$NEXT_REQUIRED"
+                        exit 1
+                      fi
+
+                      # Re-read state for next iteration
+                      read_current_state
+                    fi
+                  done
+
+                  echo ""
+                  echo "=== Gate Released ==="
+                  echo "Deployment Mode: $DEPLOYMENT_MODE"
+                outputVariables:
+                  - name: DEPLOYMENT_MODE
+                    type: String
+                    value: DEPLOYMENT_MODE
+              timeout: 4h30m  # Slightly more than MAX_WAIT_SECONDS
+
+          # Step 3: Log de confirmación
+          - step:
+              type: Run
+              name: Release_Gate
+              identifier: Release_Gate
+              spec:
+                shell: Sh
+                command: |
+                  echo "=== Deployment Gate Released ==="
+                  echo "Pipeline: <+pipeline.name>"
+                  echo "Order: <+pipeline.variables.deployment_order>"
+                  echo "Mode: <+execution.steps.Validate_Order.output.outputVariables.DEPLOYMENT_MODE>"
+                  echo "Timestamp: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+                  echo ""
+                  echo "Proceeding to deployment stages..."
+              timeout: 1m
+
+    tags: {}
+    when:
+      pipelineStatus: Success
+      # Condicional: solo ejecutar si environment requiere orden
+      # Descomenta la siguiente línea para aplicar solo a Stage env:
+      # condition: <+pipeline.variables.environment> == "stage"
+
+# Variables requeridas en el pipeline (agregar a la sección variables):
+#
+# - name: deployment_order
+#   type: String
+#   description: "Orden de despliegue (1-10)"
+#   required: true
+#   value: "X"  # Reemplazar X con el número correspondiente

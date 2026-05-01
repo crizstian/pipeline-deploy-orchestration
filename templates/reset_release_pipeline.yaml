@@ -1,0 +1,279 @@
+# Reset Release Pipeline
+# Ejecutar al inicio de un nuevo ciclo de release
+# Resetea las variables de estado a valores iniciales
+#
+# Proyecto: Global_Services (o donde corresponda)
+# Trigger: Manual
+
+pipeline:
+  name: reset_stage_release
+  identifier: reset_stage_release
+  projectIdentifier: Global_Services
+  orgIdentifier: Global
+  description: "Resetea el estado de orquestación para iniciar nuevo release"
+  tags:
+    orchestration: "true"
+    type: "admin"
+  stages:
+    - stage:
+        name: Confirm_Reset
+        identifier: Confirm_Reset
+        description: "Confirmación antes de resetear"
+        type: Approval
+        spec:
+          execution:
+            steps:
+              - step:
+                  name: Approval
+                  identifier: Approval
+                  type: HarnessApproval
+                  timeout: 1h
+                  spec:
+                    approvalMessage: |
+                      ⚠️ RESET RELEASE STATE
+
+                      Esto reseteará las variables de orquestación:
+                      - STAGE_RELEASE_NEXT_REQUIRED → "1"
+                      - STAGE_RELEASE_COMPLETED → ""
+
+                      Release ID: <+pipeline.variables.release_id>
+
+                      ¿Confirmar reset para iniciar nuevo ciclo de release?
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      minimumCount: 1
+                      disallowPipelineExecutor: false
+                      userGroups:
+                        - account.delivery_manager_usergroup
+                    isAutoRejectEnabled: false
+                    approverInputs: []
+        tags: {}
+
+    - stage:
+        name: Read_Current_State
+        identifier: Read_Current_State
+        description: "Lee estado actual antes de resetear"
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Read_State
+                  identifier: Read_State
+                  spec:
+                    connectorRef: org.simetrikclouddockerhub
+                    image: curlimages/curl:latest
+                    shell: Sh
+                    command: |
+                      echo "=== Current State (before reset) ==="
+
+                      NEXT_REQUIRED=$(curl -s --request GET \
+                        --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_NEXT_REQUIRED?accountIdentifier=<+account.identifier>" \
+                        --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                        | jq -r '.data.variable.value // "N/A"')
+
+                      COMPLETED=$(curl -s --request GET \
+                        --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_COMPLETED?accountIdentifier=<+account.identifier>" \
+                        --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                        | jq -r '.data.variable.value // "N/A"')
+
+                      RELEASE_ID=$(curl -s --request GET \
+                        --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_ID?accountIdentifier=<+account.identifier>" \
+                        --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                        | jq -r '.data.variable.value // "N/A"')
+
+                      echo "STAGE_RELEASE_NEXT_REQUIRED: $NEXT_REQUIRED"
+                      echo "STAGE_RELEASE_COMPLETED: $COMPLETED"
+                      echo "STAGE_RELEASE_ID: $RELEASE_ID"
+                      echo ""
+
+                      # Validar que el release anterior completó
+                      if [ "$NEXT_REQUIRED" != "11" ] && [ "<+pipeline.variables.force_reset>" != "true" ]; then
+                        echo "⚠️ WARNING: Previous release may not be complete"
+                        echo "   NEXT_REQUIRED=$NEXT_REQUIRED (expected 11 for complete release)"
+                        echo "   Set force_reset=true to override"
+                        echo ""
+                      fi
+
+                      export PREV_NEXT_REQUIRED="$NEXT_REQUIRED"
+                      export PREV_COMPLETED="$COMPLETED"
+                      export PREV_RELEASE_ID="$RELEASE_ID"
+                    outputVariables:
+                      - name: PREV_NEXT_REQUIRED
+                        type: String
+                        value: PREV_NEXT_REQUIRED
+                      - name: PREV_COMPLETED
+                        type: String
+                        value: PREV_COMPLETED
+                      - name: PREV_RELEASE_ID
+                        type: String
+                        value: PREV_RELEASE_ID
+                  timeout: 2m
+        tags: {}
+
+    - stage:
+        name: Reset_State
+        identifier: Reset_State
+        description: "Resetea variables a estado inicial"
+        type: Custom
+        spec:
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Reset_Variables
+                  identifier: Reset_Variables
+                  spec:
+                    connectorRef: org.simetrikclouddockerhub
+                    image: curlimages/curl:latest
+                    shell: Sh
+                    command: |
+                      #!/bin/sh
+                      set -e
+
+                      NEW_RELEASE_ID="<+pipeline.variables.release_id>"
+
+                      echo "=== Resetting Release State ==="
+                      echo "New Release ID: $NEW_RELEASE_ID"
+                      echo ""
+
+                      # Reset NEXT_REQUIRED to 1
+                      echo "Setting STAGE_RELEASE_NEXT_REQUIRED = 1"
+                      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --request PUT \
+                        --url "https://app.harness.io/gateway/ng/api/variables?accountIdentifier=<+account.identifier>" \
+                        --header "Content-Type: application/json" \
+                        --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                        --data '{
+                          "variable": {
+                            "identifier": "STAGE_RELEASE_NEXT_REQUIRED",
+                            "name": "STAGE_RELEASE_NEXT_REQUIRED",
+                            "type": "String",
+                            "value": "1"
+                          }
+                        }')
+
+                      if [ "$HTTP_CODE" -ne 200 ]; then
+                        echo "ERROR: Failed to reset NEXT_REQUIRED (HTTP $HTTP_CODE)"
+                        exit 1
+                      fi
+                      echo "  ✓ NEXT_REQUIRED reset to 1"
+
+                      # Reset COMPLETED to empty
+                      echo "Setting STAGE_RELEASE_COMPLETED = ''"
+                      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --request PUT \
+                        --url "https://app.harness.io/gateway/ng/api/variables?accountIdentifier=<+account.identifier>" \
+                        --header "Content-Type: application/json" \
+                        --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                        --data '{
+                          "variable": {
+                            "identifier": "STAGE_RELEASE_COMPLETED",
+                            "name": "STAGE_RELEASE_COMPLETED",
+                            "type": "String",
+                            "value": ""
+                          }
+                        }')
+
+                      if [ "$HTTP_CODE" -ne 200 ]; then
+                        echo "ERROR: Failed to reset COMPLETED (HTTP $HTTP_CODE)"
+                        exit 1
+                      fi
+                      echo "  ✓ COMPLETED reset to empty"
+
+                      # Update RELEASE_ID
+                      echo "Setting STAGE_RELEASE_ID = $NEW_RELEASE_ID"
+                      HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --request PUT \
+                        --url "https://app.harness.io/gateway/ng/api/variables?accountIdentifier=<+account.identifier>" \
+                        --header "Content-Type: application/json" \
+                        --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                        --data '{
+                          "variable": {
+                            "identifier": "STAGE_RELEASE_ID",
+                            "name": "STAGE_RELEASE_ID",
+                            "type": "String",
+                            "value": "'"$NEW_RELEASE_ID"'"
+                          }
+                        }')
+
+                      if [ "$HTTP_CODE" -ne 200 ]; then
+                        echo "ERROR: Failed to update RELEASE_ID (HTTP $HTTP_CODE)"
+                        exit 1
+                      fi
+                      echo "  ✓ RELEASE_ID updated"
+
+                      echo ""
+                      echo "=== Reset Complete ==="
+                  timeout: 2m
+
+              - step:
+                  type: Run
+                  name: Verify_Reset
+                  identifier: Verify_Reset
+                  spec:
+                    connectorRef: org.simetrikclouddockerhub
+                    image: curlimages/curl:latest
+                    shell: Sh
+                    command: |
+                      echo "=== Verifying Reset ==="
+
+                      NEXT_REQUIRED=$(curl -s --request GET \
+                        --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_NEXT_REQUIRED?accountIdentifier=<+account.identifier>" \
+                        --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                        | jq -r '.data.variable.value')
+
+                      COMPLETED=$(curl -s --request GET \
+                        --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_COMPLETED?accountIdentifier=<+account.identifier>" \
+                        --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                        | jq -r '.data.variable.value')
+
+                      RELEASE_ID=$(curl -s --request GET \
+                        --url "https://app.harness.io/gateway/ng/api/variables/STAGE_RELEASE_ID?accountIdentifier=<+account.identifier>" \
+                        --header "x-api-key: <+secrets.getValue('account.HARNESS_API_KEY')>" \
+                        | jq -r '.data.variable.value')
+
+                      echo "STAGE_RELEASE_NEXT_REQUIRED: $NEXT_REQUIRED"
+                      echo "STAGE_RELEASE_COMPLETED: $COMPLETED"
+                      echo "STAGE_RELEASE_ID: $RELEASE_ID"
+                      echo ""
+
+                      if [ "$NEXT_REQUIRED" = "1" ] && [ "$COMPLETED" = "" ]; then
+                        echo "✅ Reset verified successfully"
+                        echo ""
+                        echo "=========================================="
+                        echo "   NEW RELEASE CYCLE READY"
+                        echo "   Release ID: $RELEASE_ID"
+                        echo "   Services can now be deployed in order"
+                        echo "=========================================="
+                      else
+                        echo "❌ Reset verification failed"
+                        echo "   Expected: NEXT_REQUIRED=1, COMPLETED=''"
+                        echo "   Actual: NEXT_REQUIRED=$NEXT_REQUIRED, COMPLETED=$COMPLETED"
+                        exit 1
+                      fi
+                  timeout: 2m
+        tags: {}
+
+  variables:
+    - name: release_id
+      type: String
+      description: "ID del nuevo release (formato: YYYY-MM-DD-NNN)"
+      required: true
+      value: <+input>
+    - name: force_reset
+      type: String
+      description: "Forzar reset aunque el release anterior no esté completo"
+      required: false
+      value: <+input>.default(false).allowedValues(true,false)
+
+  notificationRules:
+    - name: release_reset_notification
+      identifier: release_reset_notification
+      pipelineEvents:
+        - type: PipelineSuccess
+        - type: PipelineFailed
+      notificationMethod:
+        type: Slack
+        spec:
+          userGroups: []
+          webhookUrl: <+variable.SLACK_WEBHOOK_URL>
+      enabled: true
