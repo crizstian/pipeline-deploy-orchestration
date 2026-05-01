@@ -1188,6 +1188,7 @@ A: Sí, crear pipelines de test:
 - [Apéndice A: Templates YAML](./templates/)
 - [Apéndice B: Scripts de Administración](./scripts/)
 - [Apéndice C: Diagramas Mermaid](./diagrams/)
+- [**Guía de Implementación Paso a Paso**](./IMPLEMENTATION_GUIDE.md) ← EMPEZAR AQUÍ
 
 ---
 
